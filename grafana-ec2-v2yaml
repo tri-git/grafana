@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Grafana server on EC2 in private subnet.
+Metadata:
+ AWS::CloudFormation::Interface:
+   ParameterGroups:
+   - Label:
+       default: 'General and VPC details'
+     Parameters:
+     - Prefix 
+     - Environment
+     - Department
+     - VpcStackName
+     - VpcSubnet
+   - Label:
+       default: 'Grafana EC2 instance details'
+     Parameters:   
+     - GrafanaInstanceType
+     - SshKeyName
+     - GrafanaServerPort
+
+Parameters:
+  Prefix:
+    Description: Provide a string that will be used as prefix for Name tag
+    Type: String
+    Default: c360
+    AllowedPattern: '.+'
+  
+  Environment:
+    Description: Provide the environment name. Value will be used in the Name and Environment tags
+    Type: String
+    Default: shared-services
+    AllowedPattern: '.+'
+  
+  Department:
+    Description: Department Name. Value will be used for Department tag
+    Type: String
+    Default: GDM
+    AllowedPattern: '.+'
+
+  VpcStackName:
+    Description: VPC stack name. Values for VPC ID, subnets, Cidr blocks will be taken from the stack
+    Type: String
+    Default: shared-services-stg-vpc 
+    AllowedPattern: '.+'
+
+  VpcSubnet:
+    Description: The private subnet in a VPC 
+    Type: String
+    Default: AppSubnet1
+
+  GrafanaInstanceType:
+    Description: Instance Type for Grafana Server
+    Type: String 
+    AllowedValues:
+     - t2.micro
+     - t2.small
+     - t2.medium
+     - m3.medium
+     - m3.large
+     - m3.xlarge
+     - m3.2xlarge
+    Default: t2.micro
+
+  SshKeyName: 
+    Description: Name of an EC2 KeyPair to SSH to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    Default: openvpn  
+
+  GrafanaServerPort:
+    Description: Grafana server Port  
+    Type: Number 
+    Default: 3000
+
+Mappings:
+  RegionMap:
+    us-gov-west-1:
+      AMI: ami-2bad964a
+    eu-west-2:
+      AMI: ami-01e972c347ef36521
+    ca-central-1:
+      AMI: ami-0c3e7f50c89a372ae
+
+Conditions:
+  IsNonCommercial: !Equals [!Ref AWS::Region, us-gov-west-1]
+  IsCommercial: !Not [Condition: IsNonCommercial] 
+
+Resources:  
+  GrafanaOpenVpnSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsNonCommercial
+    Properties:
+      GroupDescription: Security group for Grafana Server
+      VpcId: 
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      SecurityGroupIngress:
+      - Description: Allow access to Grafana server from OpenVpn
+        IpProtocol: tcp
+        FromPort: !Ref GrafanaServerPort
+        ToPort: !Ref GrafanaServerPort
+        SourceSecurityGroupId: 
+          Fn::ImportValue: !Sub ${VpcStackName}-OpenVpnSg
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaSg' ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaClientVpnSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsCommercial
+    Properties:
+      GroupDescription: Security group for Grafana Server
+      VpcId: 
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      SecurityGroupIngress:
+        - CidrIp: 10.0.0.0/22
+          Description: Allow access to Grafana server from Client VPN Endpoint which default uses 10.0.0.0/22
+          IpProtocol: tcp
+          FromPort: !Ref GrafanaServerPort
+          ToPort: !Ref GrafanaServerPort
+        - CidrIp: 172.0.0.0/8
+          Description: Allow access to Grafana server from each environment VPC
+          IpProtocol: tcp
+          FromPort: !Ref GrafanaServerPort
+          ToPort: !Ref GrafanaServerPort
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaSg' ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+  
+  GrafanaInstanceRole:
+    Type: AWS::IAM::Role 
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal: 
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole 
+      Path: "/"
+
+  GrafanaAccessPolicy:
+    Type: AWS::IAM::Policy 
+    Properties:
+      PolicyName: c360CloudWatchtoGrafana
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          # AllowReadingMetricsFromCloudWatch
+          - Action: 
+              - cloudwatch:DescribeAlarmsForMetric
+              - cloudwatch:ListMetrics
+              - cloudwatch:GetMetricStatistics
+              - cloudwatch:GetMetricData
+            Effect: Allow
+            Resource: "*"
+          # AllowReadingTagsInstancesRegionsFromEC2  
+          - Action:     
+              - ec2:DescribeTags
+              - ec2:DescribeInstances
+              - ec2:DescribeRegions
+            Effect: Allow 
+            Resource: "*"  
+          # AllowReadingResourcesForTags
+          - Action: 
+              - tag:GetResources
+            Effect: Allow 
+            Resource: "*"
+      Roles: 
+        - !Ref GrafanaInstanceRole
+
+  GrafanaInstanceProfile:
+    Type: AWS::IAM::InstanceProfile 
+    Properties:
+      Path: "/"
+      Roles: 
+       - !Ref GrafanaInstanceRole
+
+  ControlInterface:
+    Type: AWS::EC2::NetworkInterface
+    Properties:
+      Description: Management Interface
+      GroupSet:
+      - !If [IsCommercial, !Ref GrafanaClientVpnSg, !Ref GrafanaOpenVpnSg]
+      SourceDestCheck: true
+      SubnetId: 
+       Fn::ImportValue: !Sub ${VpcStackName}-${VpcSubnet}
+      Tags:
+        -
+          Key: Network
+          Value: Management
+  
+  # Launch Grafana EC2 instance in a VPC private subnet.  
+  GrafanaInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref AWS::Region, AMI]
+      InstanceType: !Ref GrafanaInstanceType
+      SourceDestCheck: false
+      NetworkInterfaces:
+        -
+          NetworkInterfaceId: !Ref ControlInterface
+          DeviceIndex: 0
+      IamInstanceProfile: !Ref GrafanaInstanceProfile    
+      KeyName: !Ref SshKeyName
+      Tags:
+       - Key: Name
+         Value: !Sub ${Prefix}-${Environment}-GrafanaInstance
+       - Key: Environment
+         Value: !Ref Environment
+       - Key: Department
+         Value: !Ref Department
+      UserData:
+        Fn::Base64: 
+          !Sub |
+            #!/bin/bash -xe
+            sudo yum update -y
+            # install Grafana server in EC2
+            cat >/etc/yum.repos.d/grafana.repo
+            echo "[grafana]" >> /etc/yum.repos.d/grafana.repo
+            echo "name=grafana" >> /etc/yum.repos.d/grafana.repo 
+            echo "baseurl=https://packages.grafana.com/oss/rpm" >> /etc/yum.repos.d/grafana.repo
+            echo "repo_gpgcheck=1" >> /etc/yum.repos.d/grafana.repo
+            echo "enabled=1" >> /etc/yum.repos.d/grafana.repo
+            echo "gpgcheck=1" >> /etc/yum.repos.d/grafana.repo 
+            echo "gpgkey=https://packages.grafana.com/gpg.key" >> /etc/yum.repos.d/grafana.repo
+            echo "sslverify=1" >> /etc/yum.repos.d/grafana.repo 
+            echo "sslcacert=/etc/pki/tls/certs/ca-bundle.crt" >> /etc/yum.repos.d/grafana.repo
+            sudo yum install grafana -y
+            sudo systemctl daemon-reload
+            sudo systemctl start grafana-server
+            sudo systemctl enable grafana-server.service  
+          
+Outputs:
+  GrafanaUrl:
+    Description: Grafana server Url
+    Value: 
+      Fn::Join:
+      - ''
+      - - http://
+        - !GetAtt GrafanaInstance.PrivateIp
+        - ":3000/login"

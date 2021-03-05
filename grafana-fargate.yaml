@@ -1,0 +1,381 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to deploy Grafana on AWS Fargate Cluster. 
+Metadata:
+  TemplateAuthor: Tri Tran
+  Version: 1.0    
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+    - Label:
+        default: 'General and VPC Details'
+      Parameters:
+      - Prefix
+      - Environment
+      - Department
+      - VpcStackName
+    - Label:
+        default: 'Grafana API Details'
+      Parameters:
+      - GrafanaServiceName
+      - GrafanaImageName
+      - CertificateArn
+      - GrafanaContainerPort
+      - GrafanaHealthCheckPath
+      - LoadBalancerPort
+    - Label:
+        default: 'Fargate Cluster General Details'
+      Parameters:
+      - ContainerCpu
+      - ContainerMemory
+      - DesiredCount
+
+Parameters:
+  Prefix:
+    Description: Provide a string that will be used as prefix for Name tag
+    Type: String 
+    Default: c360
+    AllowedPattern: '.+'
+
+  Environment:
+    Description: Environment name
+    Type: String
+    Default: shared-services 
+    AllowedPattern: '.+'
+
+  Department:
+    Description: Department name
+    Type: String
+    Default: GDM
+    AllowedPattern: '.+'
+
+  CertificateArn:
+    Description: ARN to certificate in AWS Certificate manager.
+    Type: String
+    #arn:aws-us-gov:acm:us-gov-west-1:533370777044:certificate/f5f5eb53-31b3-4efa-8a74-fd9fd5a11a4d
+    #arn:aws:acm:eu-west-2:444720132806:certificate/d2122f30-d05f-4ca9-bc52-568a3e50054f
+    AllowedPattern: '.+'
+
+  VpcStackName:
+    Description: VPC stack name. Values for VPC ID, subnets, Cidr blocks will be taken from the stack. E.g. shared-services-stg-vpc
+    Type: String #shared-services-stg-vpc
+    AllowedPattern: '.+'
+  
+  LoadBalancerPort: 
+    Description: The LoadBalancer port number
+    Type: Number
+    Default: 443
+
+  ContainerCpu:
+    Description: How much CPU to give the container
+    Type: Number
+    Default: 256
+    MinValue: 256
+    MaxValue: 2048
+
+  ContainerMemory:
+    Description: How much memory in megabytes MB to give the container
+    Type: Number
+    Default: 512
+    MinValue: 512
+    MaxValue: 2048
+
+  DesiredCount:
+    Description: How many copies of the service task to run
+    Type: Number
+    Default: 1
+    MinValue: 1
+    MaxValue: 5
+
+  GrafanaServiceName:
+    Description: The service name
+    Type: String
+    Default: monitor 
+    AllowedPattern: '.+'
+
+  GrafanaImageName:
+    Description: The ECR docker image for Grafana service along with image tag
+    Type: String
+    AllowedPattern: '.+'
+    ConstraintDescription: Must be a valid ECR repository image with tag Example:'cepheid/grafana:latest'
+  
+  GrafanaContainerPort:
+    Description: The port number Grafana docker container is binding to
+    Type: Number
+    Default: 3000
+
+  GrafanaHealthCheckPath:
+    Description: the path for health check
+    Type: String 
+    Default: /api/health
+    AllowedPattern: '.+'
+
+Conditions:
+  IsNonCommercial: !Equals [!Ref AWS::Region, us-gov-west-1]
+  IsCommercial: !Not [Condition: IsNonCommercial] 
+
+Resources:
+  EcsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: [ecs-tasks.amazonaws.com]
+          Action: ['sts:AssumeRole']
+      Path: /
+      Policies:
+        - PolicyName: AmazonEcsTaskExecutionRolePolicy
+          PolicyDocument:
+            Statement:
+            - Effect: Allow
+              Action:
+                # Allow the ECS Tasks to download images from ECR
+                - 'ecr:GetAuthorizationToken'
+                - 'ecr:BatchCheckLayerAvailability'
+                - 'ecr:GetDownloadUrlForLayer'
+                - 'ecr:BatchGetImage'
+
+                # Allow the ECS tasks to upload logs to CloudWatch
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+
+                # Allow the ECS tasks to pull metrics from CloudWatch
+                - 'cloudwatch:ListMetrics'
+                - 'cloudwatch:GetMetricStatistics'
+                - 'cloudwatch:GetMetricData'
+              Resource: '*'
+  
+  GrafanaFargateSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties: 
+      GroupName: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaFargateSg' ] ]
+      GroupDescription: Access to the Grafana Fargate container
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaFargateSg' ] ] 
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  FargateInternalSgIngressFromPublicALB:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Ingress from the public ALB
+      GroupId: !Ref GrafanaFargateSg
+      IpProtocol: -1
+      SourceSecurityGroupId: !If [ IsCommercial, !GetAtt GrafanaClientVpnLoadBalancerSg.GroupId, !GetAtt GrafanaOpenVpnLoadBalancerSg.GroupId ]
+
+  GrafanaClientVpnLoadBalancerSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsCommercial
+    Properties:
+      GroupName: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaClientVpnLoadBalancerSg' ] ]
+      GroupDescription: Allow access to Grafana server from Client VPN
+      VpcId:
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      SecurityGroupIngress:
+        - CidrIp: 10.0.0.0/22
+          Description: Allow access to Grafana server from Client VPN Endpoint which default uses 10.0.0.0/22
+          IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+        - CidrIp: 172.0.0.0/8
+          Description: Allow access to Grafana server from each environment VPC
+          IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaClientVpnLoadBalancerSg' ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaOpenVpnLoadBalancerSg:
+    Type: AWS::EC2::SecurityGroup
+    Condition: IsNonCommercial
+    Properties: 
+      GroupName: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaLoadBalancerSg' ] ]
+      GroupDescription: Access to the Load balancer
+      VpcId: 
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: !Ref LoadBalancerPort
+          ToPort: !Ref LoadBalancerPort
+          SourceSecurityGroupId: 
+            Fn::ImportValue: !Sub ${VpcStackName}-OpenVpnSg
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaLoadBalancerSg' ] ] 
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 31
+      HealthCheckPath: !Ref GrafanaHealthCheckPath
+      HealthCheckTimeoutSeconds: 30
+      UnhealthyThresholdCount: 2
+      HealthyThresholdCount: 2
+      Name: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ]
+      Port: !Ref GrafanaContainerPort
+      Protocol: HTTP
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: 60 
+        - Key: stickiness.enabled 
+          Value: true
+      TargetType: ip
+      VpcId: 
+        Fn::ImportValue: !Sub ${VpcStackName}-VpcId
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: 60
+      Name: !Join [ '-', [ !Ref Prefix, 'grafana-loadbalancer' ] ] 
+      Type: application
+      Scheme: internal
+      SecurityGroups: 
+        - !If [ IsCommercial, !Ref GrafanaClientVpnLoadBalancerSg, !Ref GrafanaOpenVpnLoadBalancerSg ]
+      Subnets: 
+        - Fn::ImportValue: !Sub ${VpcStackName}-AppSubnet1
+        - Fn::ImportValue: !Sub ${VpcStackName}-AppSubnet2 
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'GrafanaLoadBalancer' ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaLoadBalancerListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    DependsOn: 
+      - GrafanaLoadBalancer
+    Properties:
+      DefaultActions:
+        - TargetGroupArn: !Ref GrafanaTargetGroup
+          Type: forward
+      LoadBalancerArn: !Ref GrafanaLoadBalancer
+      Port: !Ref LoadBalancerPort
+      Protocol: HTTPS
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+
+  CloudWatchLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'grafana-fargate-lg' ] ]
+      RetentionInDays: 1
+
+  FargateCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'grafana-fargate-cluster' ] ] 
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, 'grafana-fargate-cluster' ] ] 
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+   
+  GrafanaTaskDefinition: 
+    Type: AWS::ECS::TaskDefinition
+    DependsOn: CloudWatchLogGroup
+    Properties:
+      Family: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ]
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      Memory: !Ref ContainerMemory
+      Cpu: !Ref ContainerCpu
+      ContainerDefinitions:
+        -
+          Name: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ] 
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${GrafanaImageName}" 
+          Memory: !Ref ContainerMemory
+          Cpu: !Ref ContainerCpu
+          PortMappings:
+            -
+              ContainerPort: !Ref GrafanaContainerPort
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+                awslogs-group: !Ref CloudWatchLogGroup
+                awslogs-region: !Ref AWS::Region
+                awslogs-stream-prefix: !Join [ '-', [ !Ref Environment, !Ref GrafanaServiceName] ] 
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName, 'task-definition' ] ] 
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Department
+          Value: !Ref Department
+
+  GrafanaServiceDefinition:
+    Type: AWS::ECS::Service
+    DependsOn: GrafanaLoadBalancerListener
+    Properties:
+      ServiceName: !Join [ '-',  [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ]
+      Cluster: !Ref FargateCluster
+      LaunchType: FARGATE
+      DesiredCount: !Ref DesiredCount
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 75
+        MaximumPercent: 200
+      HealthCheckGracePeriodSeconds: 30
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          SecurityGroups: [ !Ref GrafanaFargateSg]
+          Subnets: 
+            - Fn::ImportValue: !Sub ${VpcStackName}-AppSubnet1
+            - Fn::ImportValue: !Sub ${VpcStackName}-AppSubnet2  
+      TaskDefinition: !Ref GrafanaTaskDefinition
+      LoadBalancers: 
+        - ContainerName: !Join [ '-', [ !Ref Prefix, !Ref Environment, !Ref GrafanaServiceName ] ]
+          ContainerPort: !Ref GrafanaContainerPort
+          TargetGroupArn: !Ref GrafanaTargetGroup
+
+Outputs:
+  FargateClusterName:
+    Description: The name of the ECS cluster
+    Value: !Ref FargateCluster
+
+  EcsTaskExecutionRole:
+    Description: The ARN of the ECS role
+    Value: !GetAtt EcsTaskExecutionRole.Arn
+
+  GrafanaFargateSg:
+    Description: Grafana fargate SecurityGroup
+    Value: !Ref GrafanaFargateSg
+
+  GrafanaLoadBalancerSg:
+    Description: Grafana LoadBalancer SecurityGroup
+    Value: !If [IsCommercial, !Ref GrafanaClientVpnLoadBalancerSg, !Ref GrafanaOpenVpnLoadBalancerSg ]
+
+  GrafanaLoadBalancer:
+    Description: Grafana LoadBalancer DNS name
+    Value: !Join [ '', [ 'https://', !GetAtt GrafanaLoadBalancer.DNSName ] ]
+    Export:
+      Name: !Sub ${AWS::StackName}-GrafanaLoadBalancerDnsName
